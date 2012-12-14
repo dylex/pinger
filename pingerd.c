@@ -260,7 +260,7 @@ static void ping_recv(const struct timeval *t)
 	if (!p)
 		return;
 	/* currently packets failing these checks are ignored above */
-	if (ntohs(i->icmp_seq) != p->seq)
+	if (i->icmp_seq != p->seq)
 	{
 		fprintf(stderr, "icmp out of order response: %hu/%hu\n", ntohs(i->icmp_seq), p->seq);
 		return;
