@@ -2,3 +2,5 @@
 *.hi
 /pingmon
 /pingstat
+/pingerd
+/pinger
