@@ -23,6 +23,7 @@
 static int Server = -1;
 static int Icmp = -1;
 static struct sockaddr_un Server_addr = { AF_UNIX, PINGER_SOCKET };
+static bool Socket_created;
 static const char *Group;
 static unsigned Rate = 60, Rate_period = 60; /* 60/minute */
 
@@ -56,7 +57,8 @@ static uint16_t Seq;
 static void stop(int sig) __attribute__((noreturn));
 static void stop(int sig) 
 {
-	unlink(Server_addr.sun_path);
+	if (Socket_created)
+		unlink(Server_addr.sun_path);
 	exit(sig == 0);
 }
 
@@ -81,6 +83,7 @@ static void open_server()
 	mode_t omask = umask(0177);
 	if (bind(Server, &Server_addr, SUN_LEN(&Server_addr)) < 0)
 		die("server bind: %m\n");
+	Socket_created = true;
 	umask(omask);
 	struct group *gr;
 	if (Group && (gr = getgrnam(Group)))
