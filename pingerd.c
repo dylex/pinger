@@ -19,6 +19,7 @@
 #include <argp.h>
 #include <grp.h>
 #include "pinger.h"
+#include "ping.h"
 
 static int Server = -1;
 static int Icmp = -1;
@@ -26,10 +27,6 @@ static struct sockaddr_un Server_addr = { AF_UNIX, PINGER_SOCKET };
 static bool Socket_created;
 static const char *Group;
 static unsigned Rate = 60, Rate_period = 60; /* 60/minute */
-
-struct netmask {
-	in_addr_t net, mask;
-};
 
 #define MAX_FILTERS	16
 enum filter_type {
@@ -122,52 +119,16 @@ static bool test_rate(const struct timeval *t)
 	return ++count <= Rate;
 }
 
-static void open_icmp()
-{
-	if ((Icmp = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP)) < 0)
-		die("icmp socket: %m\n");
-	int opt = 1;
-	setsockopt(Icmp, SOL_SOCKET, SO_TIMESTAMP, &opt, sizeof(opt));
-}
-
-static uint16_t icmp_checksum(struct icmp *i, size_t len)
-{
-	uint32_t sum = 0;
-	uint16_t *p = (uint16_t *)i;
-	while (len >= 2)
-	{
-		sum += *(p++);
-		len -= 2;
-	}
-	if (len)
-	{
-		uint16_t x = 0;
-		*(char *)&x = *(char *)p;
-		sum += x;
-	}
-
-	sum = (sum & 0xFFFF) + (sum >> 16);
-	sum = (sum & 0xFFFF) + (sum >> 16);
-	return ~sum;
-}
-
 static int32_t timeval_diff(const struct timeval *a, const struct timeval *b)
 {
 	/* assumes no wrap-around, which should be safe with timeouts limited */
 	return 1000000 * (a->tv_sec - b->tv_sec) + (a->tv_usec - b->tv_usec);
 }
 
-static ssize_t ping_send(struct pinger *p)
+static int pinger_send(struct pinger *p)
 {
-	struct icmp i = 
-		{ .icmp_type = ICMP_ECHO
-		, .icmp_id = p->id
-		, .icmp_seq = p->seq
-		};
-	i.icmp_cksum = icmp_checksum(&i, sizeof(i));
-	struct sockaddr_in a = { AF_INET, 0, { p->req.host } };
 	gettimeofday(&p->sent, NULL);
-	return sendto(Icmp, &i, sizeof(i), 0, &a, sizeof(a));
+	return ping_send(Icmp, p->id, p->seq, (struct in_addr){ p->req.host });
 }
 
 static void ping_res(struct pinger *p, int time)
@@ -202,7 +163,7 @@ static void ping_req(const struct timeval *t)
 		return ping_res(p, -ENFILE);
 	p->id = rand();
 	p->seq = htons(Seq++);
-	if (ping_send(p) < 0)
+	if (pinger_send(p) < 0)
 		return ping_res(p, -errno);
 
 	struct pinger **pp = &Pings;
@@ -217,61 +178,32 @@ static void ping_req(const struct timeval *t)
 	*pp = p;
 }
 
-static void ping_recv(const struct timeval *t)
+static void pinger_recv(const struct timeval *t)
 {
-	struct sockaddr_in sa;
-	union {
-		char buf[4096];
-		struct ip ip;
-	} buf;
-	struct iovec io =
-		{ .iov_base = &buf
-		, .iov_len = sizeof(buf)
-		};
-	char ctlbuf[1024];
-	struct msghdr msg =
-		{ .msg_name = &sa
-		, .msg_namelen = sizeof(sa)
-		, .msg_iov = &io
-		, .msg_iovlen = 1
-		, .msg_control = &ctlbuf
-		, .msg_controllen = sizeof(ctlbuf)
-		};
-	ssize_t r = recvmsg(Icmp, &msg, 0);
-	if (r < 0)
-		die("icmp recvmsg: %m\n");
-	if (r == 0)
-		die("icmp recvmsg: closed\n");
-	if (r < sizeof(struct ip) || (r -= buf.ip.ip_hl << 2) < sizeof(struct icmp))
-	{
-		fprintf(stderr, "icmp short packet: %zd\n", r);
-		return;
-	}
-	struct icmp *i = (struct icmp *)(buf.buf + (buf.ip.ip_hl << 2));
-	if (i->icmp_type != ICMP_ECHOREPLY || icmp_checksum(i, r) || sa.sin_family != AF_INET)
-		return;
 	struct timeval pt = *t;
-	struct cmsghdr *cmsg;
-	for (cmsg = CMSG_FIRSTHDR(&msg); cmsg; cmsg = CMSG_NXTHDR(&msg, cmsg))
-		if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SO_TIMESTAMP)
-			memcpy(&pt, CMSG_DATA(cmsg), sizeof(pt));
+	uint16_t id, seq;
+	struct in_addr host;
+	int r = ping_recv(Icmp, &id, &seq, &host, &pt); 
+	if (r < 0)
+		die("ping recv: %m\n");
+	if (!r)
+		return;
+
 	struct pinger *p;
 	for (p = Pings; p; p = p->next)
-		if (i->icmp_id == p->id && i->icmp_seq == p->seq 
-				&& sa.sin_addr.s_addr == p->req.host)
+		if (id == p->id && seq == p->seq 
+				&& host.s_addr == p->req.host)
 			break;
 	if (!p)
 		return;
 	/* currently packets failing these checks are ignored above */
-	if (i->icmp_seq != p->seq)
+	if (seq != p->seq)
 	{
-		fprintf(stderr, "icmp out of order response: %hu/%hu\n", ntohs(i->icmp_seq), p->seq);
+		fprintf(stderr, "icmp out of order response: %hu/%hu\n", ntohs(seq), p->seq);
 		return;
 	}
-	if (sa.sin_family != AF_INET)
-		fprintf(stderr, "icmp response from non-IP address: %u\n", sa.sin_family);
-	else if (sa.sin_addr.s_addr != p->req.host)
-		fprintf(stderr, "icmp response from different IP: %s\n", inet_ntoa(sa.sin_addr));
+	if (host.s_addr != p->req.host)
+		fprintf(stderr, "icmp response from different IP: %s\n", inet_ntoa(host));
 	return ping_res(p, timeval_diff(&pt, &p->sent));
 }
 
@@ -294,7 +226,7 @@ static void loop()
 		Pings->timeout = Pings->req.time >= td ? Pings->req.time - td : 0;
 	}
 	if (polls[0].revents)
-		ping_recv(&t);
+		pinger_recv(&t);
 	if (polls[1].revents)
 		ping_req(&t);
 }
@@ -307,48 +239,6 @@ static const struct argp_option Options[] =
 	, { "reject", 'r', "IP[/MASK]", 0, "reject pings to given network [none]" }
 	, { }
 	};
-
-static int parse_net(in_addr_t *n, char **s)
-{
-	char *p = *s;
-	uint32_t x = 0;
-	unsigned o;
-	for (o = 0;; o ++)
-	{
-		unsigned long y = strtoul(p, &p, 0);
-		if (y > 255)
-			return -1;
-		x |= y << (8*(3-o));
-		if (o == 4 || *p != '.')
-			break;
-		p ++;
-	}
-	*s = p;
-	*n = htonl(x);
-	return o;
-}
-
-static int parse_netmask(struct netmask *nm, char *s)
-{
-	if (parse_net(&nm->net, &s) < 0)
-		return -1;
-	if (!*s)
-	{
-		nm->mask = ~0;
-		return 0;
-	}
-	if (*s++ != '/')
-		return -1;
-	int r;
-	if ((r = parse_net(&nm->mask, &s)) < 0)
-		return -1;
-	if (*s)
-		return -1;
-	if (!r && nm->mask && (r = ntohl(nm->mask) >> 24) <= 32)
-		nm->mask = ~htonl((1U << (32 - r)) - 1);
-	nm->net &= nm->mask;
-	return 1;
-}
 
 static error_t parse_opt(int key, char *optarg, struct argp_state *state)
 {
@@ -408,7 +298,9 @@ static const struct argp Argp = {
 
 int main(int argc, char **argv)
 {
-	open_icmp();
+	if ((Icmp = ping_open()) < 0)
+		die("ping_open: %m\n");
+
 	if (setuid(getuid()))
 		die("setuid: %m\n");
 
