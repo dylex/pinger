@@ -284,6 +284,29 @@ static int pingdev_release(const struct fuse_in_header *h, const struct fuse_rel
 	return 0;
 }
 
+static int pingdev_ioctl(const struct fuse_in_header *h, const struct fuse_ioctl_in *in, size_t len)
+{
+	if (len < sizeof(*in))
+		return EINVAL;
+
+	switch (in->cmd)
+	{
+		case PINGDEV_GET_INTERVAL: {
+			struct {
+				struct fuse_out_header h;
+				struct fuse_ioctl_out o;
+			} out = {
+				{ .len = sizeof(out), .unique = h->unique },
+				{ .result = Interval }
+			};
+			cuse_write(&out.h);
+			return -1;
+		}
+		default:
+			return ENOTTY;
+	}
+}
+
 static void cuse_in()
 {
 	struct {
@@ -310,7 +333,7 @@ static void cuse_in()
 			err = pingdev_release(&in.h, (struct fuse_release_in *)in.buf, r);
 			break;
 		case FUSE_IOCTL:
-			err = ENOTTY;
+			err = pingdev_ioctl(&in.h, (struct fuse_ioctl_in *)in.buf, r);
 			break;
 		default:
 			fprintf(stderr, "cuse: unhandled opcode %u\n", in.h.opcode);
