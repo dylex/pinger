@@ -1,0 +1,19 @@
+A collection of miscelaneous utilities to generate ICMP pings, with a focus on
+network monitoring and security.
+
+pingdev: A (Linux) CUSE-based device driver for /dev/ping, which can be used to
+monitor a single host from unprivledged userspace.  More features are planned
+for the future, at least bringing functionality up to match pingerd.
+
+pingerd: A daemon that serves requests sent on a local socket to ping remote
+hosts and return results.  Allows unprivledged processes to ping hosts subject
+to various constraints (packet limits, allowed networks, etc.).
+
+pinger: An example client for pingerd.
+
+pingmon: A liboping-based ping monitor that can regularly ping an number of
+host and write complete but concise logs to a file at only 4 bytes per ping + 4
+bytes per host.  Should be converted to use one of the above.
+
+pingstat: A haskell program to analyze pingmon output.  Not nearly as efficient
+or useful as it should be.
