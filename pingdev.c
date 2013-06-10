@@ -23,20 +23,23 @@ static int Cuse = -1;
 static int Ping = -1;
 
 static uint16_t Ping_id;
-static unsigned Ping_seq;
+static int Ping_seq = -1;
 static bool Ping_wait;
 static struct timeval Ping_time;
 static float Ping_last = NAN;
 
 #define BUFSIZE 256
 static struct reader {
-	unsigned seq;
+	int seq;
 	unsigned off;
 	float cur;
 	/* active only: */
+	struct reader *next, **prev;
+	/* read: */
 	uint32_t unique;
 	unsigned size;
-	struct reader *next, **prev;
+	/* poll: */
+	uint64_t kh;
 } *Readers;
 
 static void stop(int sig) __attribute__((noreturn));
@@ -171,9 +174,14 @@ static int pingdev_open(const struct fuse_in_header *h, const struct fuse_open_i
 	return -1;
 }
 
-static bool handle_read(struct reader *r)
+static inline bool poll_reader(struct reader *r)
 {
-	if (r->seq > Ping_seq)
+	return r->off || r->seq - Ping_seq <= 0;
+}
+
+static bool handle_reader(struct reader *r)
+{
+	if (!poll_reader(r))
 	{
 		if (!r->prev)
 			reader_add(r);
@@ -182,6 +190,22 @@ static bool handle_read(struct reader *r)
 
 	if (r->prev)
 		reader_del(r);
+
+	if (r->kh)
+	{
+		struct {
+			struct fuse_out_header h;
+			struct fuse_notify_poll_wakeup_out n;
+		} out = {
+			{ .len = sizeof(out), .error = FUSE_NOTIFY_POLL },
+			{ .kh = r->kh }
+		};
+		cuse_write(&out.h);
+		r->kh = 0;
+	}
+
+	if (!r->size)
+		return true;
 
 	if (!r->off)
 	{
@@ -193,15 +217,11 @@ static bool handle_read(struct reader *r)
 	char *buf = buffer;
 	int len;
 
-	if (isnan(r->cur))
-		len = 0;
-	else {
-		len = snprintf(buf, BUFSIZE, "%f\n", 1000*r->cur);
-		if (len > BUFSIZE)
-			len = BUFSIZE;
-		if (len < 0)
-			len = 0;
-	}
+	len = snprintf(buf, BUFSIZE, "%f\n", 1000*r->cur);
+	if (len > BUFSIZE)
+		len = BUFSIZE;
+	if (len < 0)
+		die("snprintf: %m\n");
 	buf += r->off;
 	len -= r->off;
 
@@ -216,28 +236,32 @@ static bool handle_read(struct reader *r)
 		r->off = 0;
 	}
 
-	if (!len)
-	{
-		if (!r->prev)
-			reader_add(r);
-		return true;
-	}
-
 	struct {
 		struct fuse_out_header h;
 		char buf[BUFSIZE];
-	} out = {
+	} __attribute__((packed)) out = {
 		{ .len = sizeof(out.h) + len, .unique = r->unique }
 	};
 	memcpy(out.buf, buf, len);
 	cuse_write(&out.h);
+	r->size = 0;
 
 	return true;
 }
 
 static void handle_readers()
 {
-	while (Readers && handle_read(Readers));
+	while (Readers && handle_reader(Readers));
+}
+
+static void interrupt_reader(struct reader *r)
+{
+	if (r->size)
+	{
+		struct fuse_out_header out = { .len = sizeof(out), .error = -EINTR, .unique = r->unique };
+		cuse_write(&out);
+		r->size = 0;
+	}
 }
 
 static int pingdev_read(const struct fuse_in_header *h, const struct fuse_read_in *in, size_t len)
@@ -245,10 +269,14 @@ static int pingdev_read(const struct fuse_in_header *h, const struct fuse_read_i
 	if (len < sizeof(*in))
 		return EINVAL;
 
+	if (!in->size)
+		return 0;
+
 	struct reader *r = (struct reader *)in->fh;
+	interrupt_reader(r);
 	r->unique = h->unique;
 	r->size = in->size;
-	handle_read(r);
+	handle_reader(r);
 	return -1;
 }
 
@@ -262,14 +290,13 @@ static int pingdev_interrupt(const struct fuse_in_header *h, const struct fuse_i
 	{
 		if (r->unique == in->unique)
 		{
-			struct fuse_out_header out = { .len = sizeof(out), .error = -EINTR, .unique = r->unique };
-			cuse_write(&out);
+			interrupt_reader(r);
 			reader_del(r);
-			return -1;
+			break;
 		}
 	}
 
-	return EBADF;
+	return -1;
 }
 
 static int pingdev_release(const struct fuse_in_header *h, const struct fuse_release_in *in, size_t len)
@@ -289,8 +316,24 @@ static int pingdev_ioctl(const struct fuse_in_header *h, const struct fuse_ioctl
 	if (len < sizeof(*in))
 		return EINVAL;
 
+	struct reader *r = (struct reader *)in->fh;
 	switch (in->cmd)
 	{
+		case PINGDEV_GET_PING: {
+			struct {
+				struct fuse_out_header h;
+				struct fuse_ioctl_out o;
+				float p;
+			} __attribute__((packed)) out = {
+				{ .len = sizeof(out), .unique = h->unique },
+				{ .result = Ping_seq & INT_MAX },
+				Ping_last
+			};
+			cuse_write(&out.h);
+			if (!r->prev)
+				r->seq = Ping_seq + 1;
+			return -1;
+	        }
 		case PINGDEV_GET_INTERVAL: {
 			struct {
 				struct fuse_out_header h;
@@ -302,9 +345,53 @@ static int pingdev_ioctl(const struct fuse_in_header *h, const struct fuse_ioctl
 			cuse_write(&out.h);
 			return -1;
 		}
+		case PINGDEV_GET_TARGET: {
+			struct {
+				struct fuse_out_header h;
+				struct fuse_ioctl_out o;
+				struct in_addr a;
+			} out = {
+				{ .len = sizeof(out), .unique = h->unique },
+				{ },
+				Target
+			};
+			cuse_write(&out.h);
+			return -1;
+		}
 		default:
 			return ENOTTY;
 	}
+}
+
+static int pingdev_poll(const struct fuse_in_header *h, const struct fuse_poll_in *in, size_t len)
+{
+	const unsigned events = POLLIN | POLLRDNORM;
+	if (len < sizeof(*in))
+		return EINVAL;
+
+	if (!(in->events & events))
+		return EINVAL;
+
+	struct reader *r = (struct reader *)in->fh;
+	bool p = poll_reader(r);
+
+	struct {
+		struct fuse_out_header h;
+		struct fuse_poll_out o;
+	} out = {
+		{ .len = sizeof(out), .unique = h->unique },
+		{ .revents = p ? events : 0 }
+	};
+	cuse_write(&out.h);
+
+	if (!p && in->flags & FUSE_POLL_SCHEDULE_NOTIFY) 
+	{
+		r->kh = in->kh;
+		if (!r->prev)
+			reader_add(r);
+	}
+
+	return -1;
 }
 
 static void cuse_in()
@@ -334,6 +421,9 @@ static void cuse_in()
 			break;
 		case FUSE_IOCTL:
 			err = pingdev_ioctl(&in.h, (struct fuse_ioctl_in *)in.buf, r);
+			break;
+		case FUSE_POLL:
+			err = pingdev_poll(&in.h, (struct fuse_poll_in *)in.buf, r);
 			break;
 		default:
 			fprintf(stderr, "cuse: unhandled opcode %u\n", in.h.opcode);
