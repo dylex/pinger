@@ -23,14 +23,14 @@ static int Cuse = -1;
 static int Ping = -1;
 
 static uint16_t Ping_id;
-static int Ping_seq = -1;
+static unsigned Ping_seq;
 static bool Ping_wait;
 static struct timeval Ping_time;
 static float Ping_last = NAN;
 
 #define BUFSIZE 256
 static struct reader {
-	int seq;
+	unsigned seq;
 	unsigned off;
 	float cur;
 	/* active only: */
@@ -160,8 +160,6 @@ static int pingdev_open(const struct fuse_in_header *h, const struct fuse_open_i
 	}
 
 	struct reader *r = calloc(sizeof(*r), 1);
-	r->seq = Ping_seq;
-
 	struct {
 		struct fuse_out_header h;
 		struct fuse_open_out o;
@@ -176,7 +174,21 @@ static int pingdev_open(const struct fuse_in_header *h, const struct fuse_open_i
 
 static inline bool poll_reader(struct reader *r)
 {
-	return r->off || r->seq - Ping_seq <= 0;
+	return r->off || r->seq != Ping_seq;
+}
+
+static float reader_value(const struct reader *r)
+{
+	float p = Ping_last;
+	if (r->seq != Ping_seq - 1 && Ping_wait)
+	{
+		struct timeval t;
+		gettimeofday(&t, NULL);
+		float dt = timeval_diff(&t, &Ping_time);
+		if (dt > p)
+			p = dt;
+	}
+	return p;
 }
 
 static bool handle_reader(struct reader *r)
@@ -209,8 +221,8 @@ static bool handle_reader(struct reader *r)
 
 	if (!r->off)
 	{
-		r->seq = Ping_seq;
-		r->cur = Ping_last;
+		r->cur = reader_value(r);
+		r->seq = Ping_seq - 1;
 	}
 
 	static char buffer[BUFSIZE];
@@ -326,12 +338,12 @@ static int pingdev_ioctl(const struct fuse_in_header *h, const struct fuse_ioctl
 				float p;
 			} __attribute__((packed)) out = {
 				{ .len = sizeof(out), .unique = h->unique },
-				{ .result = Ping_seq & INT_MAX },
-				Ping_last
+				{ .result = (Ping_seq - 1) & INT_MAX },
+				reader_value(r)
 			};
 			cuse_write(&out.h);
 			if (!r->prev)
-				r->seq = Ping_seq + 1;
+				r->seq = Ping_seq;
 			return -1;
 	        }
 		case PINGDEV_GET_INTERVAL: {
@@ -384,7 +396,7 @@ static int pingdev_poll(const struct fuse_in_header *h, const struct fuse_poll_i
 	};
 	cuse_write(&out.h);
 
-	if (!p && in->flags & FUSE_POLL_SCHEDULE_NOTIFY) 
+	if (!p && in->flags & FUSE_POLL_SCHEDULE_NOTIFY && in->kh)
 	{
 		r->kh = in->kh;
 		if (!r->prev)
@@ -463,7 +475,7 @@ static void ping_in()
 	{
 		ping_update(timeval_diff(&t, &Ping_time));
 	}
-	else if (seq == (uint16_t)Ping_seq-1 && isinf(Ping_last) == 1)
+	else if (seq == (uint16_t)(Ping_seq-1) && isinf(Ping_last))
 	{
 		Ping_last = timeval_diff(&t, &Ping_time) + Interval;
 	}
