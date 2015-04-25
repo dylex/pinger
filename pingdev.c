@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <syslog.h>
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <linux/fuse.h>
@@ -18,15 +19,19 @@
 static char Devname[256] = "ping"; 
 static unsigned short Interval = 60;
 static struct in_addr Target;
+static unsigned Count;
+static float Threshold = INFINITY;
 
 static int Cuse = -1;
 static int Ping = -1;
 
+static char Target_str[INET_ADDRSTRLEN];
 static uint16_t Ping_id;
 static unsigned Ping_seq;
 static bool Ping_wait;
 static struct timeval Ping_time;
 static float Ping_last = NAN;
+static unsigned Ping_down;
 
 #define BUFSIZE 256
 static struct reader {
@@ -448,6 +453,28 @@ static void cuse_in()
 	}
 }
 
+void log_down(bool up) {
+	unsigned t = Interval * Ping_down;
+	char u;
+	if (t < 60)
+		u = 's';
+	else {
+		t /= 60;
+		if (t < 60)
+			u = 'm';
+		else {
+			t /= 60;
+			if (t < 24)
+				u = 'h';
+			else {
+				t /= 24;
+				u = 'd';
+			}
+		}
+	}
+	syslog(up ? LOG_NOTICE : LOG_WARNING, "%s: %s %u%c", Target_str, up ? "up after" : "down for", t, u);
+}
+
 static void ping_update(float t)
 {
 	Ping_last = t;
@@ -455,6 +482,14 @@ static void ping_update(float t)
 	Ping_seq ++;
 
 	handle_readers();
+
+	if (t >= Threshold && ++Ping_down == Count)
+		log_down(false);
+	else {
+		if (Ping_down >= Count)
+			log_down(true);
+		Ping_down = 0;
+	}
 }
 
 static void ping_in()
@@ -513,6 +548,8 @@ static void loop()
 static const struct argp_option Options[] = 
 	{ { "devname", 'd', "NAME", 0, "use character device /dev/NAME [ping]" }
 	, { "interval", 'i', "SECS", 0, "interval/timeout between pings [60]" }
+	, { "threshold", 't', "SECS", 0, "ping time to consider \"down\" [inf]" }
+	, { "count", 'c', "COUNT", 0, "number of consecutive pings to consider \"down\" [0=disabled]" }
 	, { }
 	};
 
@@ -529,6 +566,18 @@ static error_t parse_opt(int key, char *optarg, struct argp_state *state)
 			Interval = strtoul(optarg, &p, 10);
 			if (!Interval || *p)
 				argp_error(state, "invalid interval: %s", optarg);
+			return 0;
+
+		case 'c':
+			Count = strtoul(optarg, &p, 10);
+			if (*p)
+				argp_error(state, "invalid count: %s", optarg);
+			return 0;
+
+		case 't':
+			Threshold = strtof(optarg, &p);
+			if (*p || Threshold <= 0)
+				argp_error(state, "invalid threshold: %s", optarg);
 			return 0;
 
 		case ARGP_KEY_ARG:
@@ -571,6 +620,8 @@ int main(int argc, char **argv)
 		die("argp_parse: %m\n");
 
 	cuse_init();
+	openlog("ping", 0, LOG_NEWS);
+	inet_ntop(AF_INET, &Target, Target_str, sizeof(Target_str));
 
 	if (signal(SIGTERM, &stop) == SIG_ERR ||
 			signal(SIGINT, &stop) == SIG_ERR)
