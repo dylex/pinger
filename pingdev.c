@@ -483,9 +483,11 @@ static void ping_update(float t)
 
 	handle_readers();
 
-	if (t >= Threshold && ++Ping_down == Count)
-		log_down(false);
-	else {
+	if (t >= Threshold) {
+		if (++Ping_down == Count)
+			log_down(false);
+	}
+	else if (Count) {
 		if (Ping_down >= Count)
 			log_down(true);
 		Ping_down = 0;

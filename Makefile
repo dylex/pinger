@@ -15,3 +15,4 @@ install: $(PROGS)
 	install -t $(BINDIR) pinger
 	install -o root -m 4755 -t $(BINDIR) pingmon
 	install -t $(BINDIR) pingstat
+	install -t /usr/sbin pingdev
