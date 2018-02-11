@@ -46,6 +46,7 @@ static struct pinger {
 	struct timeval sent;
 	uint16_t id;
 	uint16_t seq;
+	uint16_t size;
 	uint32_t timeout;
 	struct pinger *next, **prev;
 } *Pings;
@@ -128,7 +129,7 @@ static int32_t timeval_diff(const struct timeval *a, const struct timeval *b)
 static int pinger_send(struct pinger *p)
 {
 	gettimeofday(&p->sent, NULL);
-	return ping_send(Icmp, p->id, p->seq, (struct in_addr){ p->req.host });
+	return ping_send(Icmp, p->id, p->seq, p->size, (struct in_addr){ p->req.host });
 }
 
 static void ping_res(struct pinger *p, int time)

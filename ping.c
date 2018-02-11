@@ -79,19 +79,33 @@ static uint16_t icmp_checksum(struct icmp *i, size_t len)
 	return ~sum;
 }
 
-int ping_send(int icmp, uint16_t id, uint16_t seq, struct in_addr host)
+struct icmp_packet {
+	struct ip ip;
+	struct icmp icmp;
+	char buf[PING_MAX_SIZE-sizeof(struct icmp)-sizeof(struct ip)];
+};
+
+int ping_send(int icmp, uint16_t id, uint16_t seq, uint16_t size, struct in_addr host)
 {
-	struct icmp i = 
+	if (size < PING_MIN_SIZE)
+		size = PING_MIN_SIZE;
+	else if (size > PING_MAX_SIZE) {
+		errno = EMSGSIZE;
+		return -1;
+	}
+	struct icmp_packet p = { .icmp =
 		{ .icmp_type = ICMP_ECHO
 		, .icmp_id = id
 		, .icmp_seq = seq
-		};
-	i.icmp_cksum = icmp_checksum(&i, sizeof(i));
+		}
+	};
+	size -= sizeof(struct ip);
+	p.icmp.icmp_cksum = icmp_checksum(&p.icmp, size);
 	struct sockaddr_in a = { AF_INET, 0, host };
-	ssize_t r = sendto(icmp, &i, sizeof(i), 0, &a, sizeof(a));
+	ssize_t r = sendto(icmp, &p.icmp, size, 0, &a, sizeof(a));
 	if (r < 0)
 		return -1;
-	if (r < sizeof(i))
+	if (r < size)
 	{
 		errno = ENOBUFS;
 		return -1;
@@ -102,13 +116,10 @@ int ping_send(int icmp, uint16_t id, uint16_t seq, struct in_addr host)
 int ping_recv(int icmp, uint16_t *id, uint16_t *seq, struct in_addr *host, struct timeval *ts)
 {
 	struct sockaddr_in sa;
-	union {
-		char buf[4096];
-		struct ip ip;
-	} buf;
+	struct icmp_packet p;
 	struct iovec io =
-		{ .iov_base = &buf
-		, .iov_len = sizeof(buf)
+		{ .iov_base = &p
+		, .iov_len = sizeof(p)
 		};
 	char ctlbuf[1024];
 	struct msghdr msg =
@@ -127,20 +138,23 @@ int ping_recv(int icmp, uint16_t *id, uint16_t *seq, struct in_addr *host, struc
 		errno = ECANCELED;
 		return -1;
 	}
-	if (r < sizeof(struct ip) || (r -= buf.ip.ip_hl << 2) < sizeof(struct icmp))
+	if (r < sizeof(struct ip) || (r -= p.ip.ip_hl << 2) < 8)
 		return 0;
-	struct icmp *i = (struct icmp *)(buf.buf + (buf.ip.ip_hl << 2));
+	// struct icmp *i = &p.icmp;
+	struct icmp *i = (struct icmp *)((uint32_t *)&p + p.ip.ip_hl);
 	if (i->icmp_type != ICMP_ECHOREPLY || icmp_checksum(i, r) || sa.sin_family != AF_INET)
 		return 0;
 	*id = i->icmp_id;
 	*seq = i->icmp_seq;
 	*host = sa.sin_addr;
-	struct cmsghdr *cmsg;
-	for (cmsg = CMSG_FIRSTHDR(&msg); cmsg; cmsg = CMSG_NXTHDR(&msg, cmsg))
-		if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SO_TIMESTAMP)
-		{
-			memcpy(ts, CMSG_DATA(cmsg), sizeof(*ts));
-			break;
-		}
+	if (ts) {
+		struct cmsghdr *cmsg;
+		for (cmsg = CMSG_FIRSTHDR(&msg); cmsg; cmsg = CMSG_NXTHDR(&msg, cmsg))
+			if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SO_TIMESTAMP)
+			{
+				memcpy(ts, CMSG_DATA(cmsg), sizeof(*ts));
+				break;
+			}
+	}
 	return 1;
 }

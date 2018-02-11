@@ -530,7 +530,8 @@ static void loop()
 
 		timerclear(&diff);
 		Ping_time = now;
-		ping_send(Ping, Ping_id, Ping_seq, Target);
+		if (ping_send(Ping, Ping_id, Ping_seq, 0, Target))
+			die("ping_send: %m\n");
 		Ping_wait = true;
 	}
 
