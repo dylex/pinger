@@ -96,11 +96,16 @@ static inline float timeval_diff(const struct timeval *a, const struct timeval *
 
 static size_t cuse_read(struct fuse_in_header *in, size_t len)
 {
-	ssize_t r = read(Cuse, in, sizeof(*in)+len);
+	static union {
+		struct fuse_in_header in;
+		char buf[FUSE_MIN_READ_BUFFER];
+	} buf;
+	ssize_t r = read(Cuse, buf.buf, sizeof(buf));
 	if (r < 0)
 		die("cuse read: %m\n");
-	if (r < sizeof(*in) || r != in->len)
-		die("cuse read: invalid message (%zd/%u)\n", r, in->len);
+	if (r < sizeof(*in) || r != buf.in.len || r-sizeof(*in) > len)
+		die("cuse read: invalid message (%zd/%u/%zu)\n", r, buf.in.len, len);
+	memcpy(in, buf.buf, r);
 	return r - sizeof(*in);
 }
 
